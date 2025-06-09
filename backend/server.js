@@ -4,9 +4,8 @@ const io = require("socket.io")(5000, {
   },
 });
 
-// Store offers and connected sockets
-const offers = []; // { roomId, offer, offerIceCandidates, answer, answererIceCandidates }
-const connectedSockets = []; // { socketId, roomId }
+// Store room data
+const rooms = new Map(); // { roomId: { participants: [socketId], offers: [], answers: [] } }
 
 io.on("connection", (socket) => {
   console.log("a user connected:", socket.id);
@@ -14,105 +13,101 @@ io.on("connection", (socket) => {
   // Listen for user joining
   socket.on("join_room", (data) => {
     const { roomId } = data;
-    const room = io.sockets.adapter.rooms.get(roomId);
 
-    // Ensure only 2 users per room
-    if (room && room.size >= 2) {
-      socket.emit("room_full", { roomId });
-      return;
+    // Initialize room if it doesn't exist
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, { participants: [], offers: [], answers: [], iceCandidates: [], });
     }
 
+    const room = rooms.get(roomId);
+
+    // Add user to the room
+    room.participants.push(socket.id);
     socket.join(roomId);
     console.log(`User (ID: ${socket.id}) joined room: ${roomId}`);
 
-    // Add user to connectedSockets
-    connectedSockets.push({ socketId: socket.id, roomId });
+    // Notify other users in the room
+    socket.to(roomId).emit("user_joined", { socketId: socket.id });
   });
 
   // Listen for new offers
   socket.on("start_call", (data) => {
-    const { roomId, offer } = data;
-    console.log(`Call initiated in room ${roomId}`);
+    const { roomId, offer,targetId  } = data;
+    console.log(`Call initiated in room ${roomId} to target ${targetId}`);
 
-    const existingOffer = offers.find((o) => o.roomId === roomId);
-    if (existingOffer) {
-      console.warn(`Offer already exists for room ${roomId}, skipping duplicate`);
+    const room = rooms.get(roomId);
+
+    if (!room) {
+      console.error(`Room ${roomId} not found.`);
       return;
     }
 
-    // Add offer to the list
-    offers.push({
-      roomId,
-      offer,
-      offerIceCandidates: [],
-      answer: null,
-      answererIceCandidates: [],
-    });
+    // Add offer to the room
+    room.offers.push({ socketId: socket.id, offer });
 
-     // Debugging
-
-    // Notify other users in the room
-    socket.to(roomId).emit("incoming_call", { offer });
+    // Broadcast the offer to all other participants
+    io.to(targetId).emit("incoming_call", { offer, callerId: socket.id });
   });
 
-  // Listen for new answers
-  socket.on("accept_call", (data, ackFunction) => {
-    const { roomId, answer } = data;
-    console.log(`Call accepted in room: ${roomId}`);
+// Listen for new answers
+socket.on("accept_call", (data, ackFunction) => {
+  const { roomId, answer, callerId } = data;
+  console.log(`Call accepted in room: ${roomId}`);
 
-    // Find the offer to update
-    const offerToUpdate = offers.find(
-      (o) => o.roomId === roomId && o.answer === null
-    );
+  const room = rooms.get(roomId);
+  if (!room) {
+    console.error(`Room ${roomId} not found.`);
+    return;
+  }
 
-    if (!offerToUpdate) {
-      console.error("No matching offer found.");
-      return;
-    }
+  // Add answer to the room
+  room.answers.push({ socketId: socket.id, answer, callerId });
 
-    // Update the offer with the answer
-    offerToUpdate.answer = answer;
+  // Send the answer to the caller
+  io.to(callerId).emit("call_accepted", { answer, calleeId: socket.id });
 
-    // Send back existing ICE candidates to the answerer
-    if (typeof ackFunction === "function") {
-      ackFunction(offerToUpdate.offerIceCandidates);
-    } else {
-      console.error("No acknowledgment function provided.");
-    }
-
-    // Notify the caller about the answer
-    socket.to(roomId).emit("call_accepted", {
-      answer,
-      roomId,
-    });
-  });
+  // Send back existing ICE candidates to the answerer
+  if (typeof ackFunction === "function") {
+    const candidates = room.iceCandidates
+      .filter((candidate) => candidate.senderId === callerId)
+      .map((candidate) => ({
+        candidate: candidate.candidate.candidate,
+        sdpMid: candidate.candidate.sdpMid || "0", // Default value if missing
+        sdpMLineIndex: candidate.candidate.sdpMLineIndex || 0, // Default value if missing
+      }));
+    ackFunction(candidates);
+  }
+});
 
   // Listen for ICE candidates
   socket.on("ice-candidate", (data) => {
-    const { roomId, candidate, didIOffer } = data;
-
-    // Find the offer to update
-    const offerToUpdate = offers.find((o) => o.roomId === roomId);
-
-    if (!offerToUpdate) {
-      console.error("No matching offer found.");
+    const { roomId, candidate, targetId } = data;
+  
+    const room = rooms.get(roomId);
+    if (!room) {
+      console.error(`Room ${roomId} not found.`);
       return;
     }
-
-    // Add ICE candidate to the appropriate list
-    if (didIOffer) {
-      offerToUpdate.offerIceCandidates.push(candidate);
+  
+    // Store ICE candidate
+    room.iceCandidates.push({ senderId: socket.id, candidate });
+  
+    // Send ICE candidate to the target user
+    if (targetId) {
+      io.to(targetId).emit("ice-candidate", {
+        candidate: candidate.candidate,
+        sdpMid: candidate.sdpMid || "0", // Default value if missing
+        sdpMLineIndex: candidate.sdpMLineIndex || 0, // Default value if missing
+        senderId: socket.id,
+      });
     } else {
-      offerToUpdate.answererIceCandidates.push(candidate);
-    }
-
-    // Determine who to send the ICE candidate to
-    const targetSocketId = didIOffer
-      ? connectedSockets.find((s) => s.roomId === roomId && s.socketId !== socket.id)?.socketId
-      : connectedSockets.find((s) => s.roomId === roomId && s.socketId !== socket.id)?.socketId;
-
-    if (targetSocketId) {
-      io.to(targetSocketId).emit("ice-candidate", { candidate });
+      // Broadcast to all participants in the room
+      socket.to(roomId).emit("ice-candidate", {
+        candidate: candidate.candidate,
+        sdpMid: candidate.sdpMid || "0", // Default value if missing
+        sdpMLineIndex: candidate.sdpMLineIndex || 0, // Default value if missing
+        senderId: socket.id,
+      });
     }
   });
 
@@ -121,34 +116,35 @@ io.on("connection", (socket) => {
     const { roomId } = data;
     console.log(`User in room ${roomId} hung up`);
 
-    // Clean up offers for this room
-    const offerIndex = offers.findIndex((o) => o.roomId === roomId);
-    if (offerIndex !== -1) {
-      offers.splice(offerIndex, 1);
-    }
+    const room = rooms.get(roomId);
+    if (room) {
+      // Clean up offers and answers for this user
+      room.offers = room.offers.filter((offer) => offer.socketId !== socket.id);
+      room.answers = room.answers.filter((answer) => answer.socketId !== socket.id);
 
-    socket.to(roomId).emit("hangup");
+      // Notify other users in the room
+      socket.to(roomId).emit("hangup", { socketId: socket.id });
+    }
   });
 
   // Listen for disconnect
   socket.on("disconnect", () => {
     console.log("user disconnected:", socket.id);
 
-    // Remove user from connectedSockets
-    const socketIndex = connectedSockets.findIndex((s) => s.socketId === socket.id);
-    const roomId = connectedSockets[socketIndex]?.roomId;
-    if (socketIndex !== -1) {
-      
-      connectedSockets.splice(socketIndex, 1);
-    }
+    // Remove user from all rooms
+    rooms.forEach((room, roomId) => {
+      room.participants = room.participants.filter((id) => id !== socket.id);
+      room.offers = room.offers.filter((offer) => offer.socketId !== socket.id);
+      room.answers = room.answers.filter((answer) => answer.socketId !== socket.id);
 
-    
-  
-    const offerIndex = offers.findIndex((o) => o.roomId === roomId);
-    if (offerIndex !== -1) {
-      offers.splice(offerIndex, 1);
-    }
-    
+      // Notify other users in the room
+      if (room.participants.length > 0) {
+        io.to(roomId).emit("user_left", { socketId: socket.id });
+      } else {
+        // Delete the room if empty
+        rooms.delete(roomId);
+      }
+    });
   });
 
   // Handle leave_room event
@@ -156,37 +152,36 @@ io.on("connection", (socket) => {
     const { roomId } = data;
     console.log(`User ${socket.id} left room: ${roomId}`);
 
-    // Remove user from connectedSockets
-    const socketIndex = connectedSockets.findIndex((s) => s.socketId === socket.id);
-    if (socketIndex !== -1) {
-      connectedSockets.splice(socketIndex, 1);
-    }
+    const room = rooms.get(roomId);
+    if (room) {
+      // Remove user from the room
+      room.participants = room.participants.filter((id) => id !== socket.id);
+      room.offers = room.offers.filter((offer) => offer.socketId !== socket.id);
+      room.answers = room.answers.filter((answer) => answer.socketId !== socket.id);
 
-    const room = io.sockets.adapter.rooms.get(roomId);
-    if (!room || room.size === 0) {
-      // If no one is left, remove the offer
-      const offerIndex = offers.findIndex((o) => o.roomId === roomId);
-      if (offerIndex !== -1) {
-        offers.splice(offerIndex, 1);
+      // Notify other users in the room
+      socket.to(roomId).emit("user_left", { socketId: socket.id });
+
+      // Delete the room if empty
+      if (room.participants.length === 0) {
+        rooms.delete(roomId);
       }
     }
 
     socket.leave(roomId);
-    socket.to(roomId).emit("user_left", { socketId: socket.id });
   });
-
 
   // Handle reject_call event
   socket.on("reject_call", (data) => {
     const { roomId } = data;
     console.log(`Call rejected in room: ${roomId}`);
 
-    // Clean up offers for this room
-    const offerIndex = offers.findIndex((o) => o.roomId === roomId);
-    if (offerIndex !== -1) {
-      offers.splice(offerIndex, 1);
+    const room = rooms.get(roomId);
+    if (room) {
+      // Clean up offers for this room
+      room.offers = room.offers.filter((offer) => offer.socketId !== socket.id);
     }
 
-    socket.to(roomId).emit("call_rejected");
+    socket.to(roomId).emit("call_rejected", { socketId: socket.id });
   });
 });
